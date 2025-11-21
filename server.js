@@ -99,7 +99,20 @@ const generatePassword = (length = 8) => {
 connectDB();
 
 const app = express();
+
+// Проверка и инициализация Stripe
+console.log('=== ИНИЦИАЛИЗАЦИЯ STRIPE ===');
+console.log('STRIPE_SECRET_KEY существует:', !!process.env.STRIPE_SECRET_KEY);
+console.log('STRIPE_SECRET_KEY начинается с sk_:', process.env.STRIPE_SECRET_KEY?.startsWith('sk_'));
+
+if (!process.env.STRIPE_SECRET_KEY) {
+    console.error('❌ КРИТИЧЕСКАЯ ОШИБКА: STRIPE_SECRET_KEY не установлен!');
+    console.error('Установите переменную окружения STRIPE_SECRET_KEY на Railway');
+    process.exit(1);
+}
+
 const stripeInstance = stripe(process.env.STRIPE_SECRET_KEY);
+console.log('✅ Stripe инициализирован успешно');
 
 // Middleware для CORS - должен быть ПЕРВЫМ
 app.use((req, res, next) => {
@@ -119,23 +132,20 @@ app.use((req, res, next) => {
 
 app.use(express.json());
 
-// Тарифные планы с Price ID из Stripe
+// Тарифные планы для одноразовых платежей
 const PLANS = {
     basic: {
         name: 'Базовый план (4-Week)',
-        priceId: process.env.STRIPE_BASIC_PRICE_ID, // добавьте в .env
-        fallbackPrice: 699, // $6.99 в центах (минимум 50 центов)
+        fallbackPrice: 699, // $6.99 в центах
         currency: 'usd'
     },
     premium: {
         name: 'Премиум план (8-Week)',
-        priceId: process.env.STRIPE_PREMIUM_PRICE_ID, // добавьте в .env
         fallbackPrice: 1599, // $15.99 в центах
         currency: 'usd'
     },
     pro: {
         name: 'Про план (12-Week)',
-        priceId: process.env.STRIPE_PRO_PRICE_ID, // добавьте в .env
         fallbackPrice: 2599, // $25.99 в центах
         currency: 'usd'
     }
@@ -145,15 +155,29 @@ const PLANS = {
 app.post('/create-checkout-session', async (req, res) => {
     try {
         const { planId } = req.body;
+        console.log('=== СОЗДАНИЕ CHECKOUT СЕССИИ ===');
         console.log('Получен запрос на создание сессии для плана:', planId);
+        console.log('CLIENT_URL:', process.env.CLIENT_URL);
+        console.log('STRIPE_SECRET_KEY существует:', !!process.env.STRIPE_SECRET_KEY);
+
+        if (!planId) {
+            console.log('❌ planId не передан');
+            return res.status(400).json({ error: 'Plan ID is required' });
+        }
 
         if (!PLANS[planId]) {
-            console.log('Неверный план:', planId);
+            console.log('❌ Неверный план:', planId);
+            console.log('Доступные планы:', Object.keys(PLANS));
             return res.status(400).json({ error: 'Invalid pricing plan' });
         }
 
         const plan = PLANS[planId];
-        console.log('Выбранный план:', plan);
+        console.log('✅ Выбранный план:', plan);
+
+        if (!process.env.CLIENT_URL) {
+            console.log('❌ CLIENT_URL не установлен');
+            return res.status(500).json({ error: 'Server configuration error: CLIENT_URL not set' });
+        }
 
         let sessionConfig = {
             payment_method_types: ['card'],
@@ -162,39 +186,46 @@ app.post('/create-checkout-session', async (req, res) => {
             cancel_url: `${process.env.CLIENT_URL}/paywall`,
         };
 
-        // Используем Price ID если есть, иначе создаем цену на лету
-        if (plan.priceId && plan.priceId.startsWith('price_')) {
-            console.log('Используем Price ID:', plan.priceId);
-            sessionConfig.line_items = [
-                {
-                    price: plan.priceId,
-                    quantity: 1,
-                }
-            ];
-        } else {
-            console.log('Создаем цену на лету, fallback price:', plan.fallbackPrice);
-            sessionConfig.line_items = [
-                {
-                    price_data: {
-                        currency: plan.currency,
-                        product_data: {
-                            name: plan.name,
-                        },
-                        unit_amount: plan.fallbackPrice,
+        console.log('Success URL:', sessionConfig.success_url);
+        console.log('Cancel URL:', sessionConfig.cancel_url);
+
+        // Всегда создаем цену на лету для одноразовых платежей
+        console.log('Создаем цену на лету, fallback price:', plan.fallbackPrice);
+        sessionConfig.line_items = [
+            {
+                price_data: {
+                    currency: plan.currency,
+                    product_data: {
+                        name: plan.name,
                     },
-                    quantity: 1,
-                }
-            ];
-        }
+                    unit_amount: plan.fallbackPrice,
+                },
+                quantity: 1,
+            }
+        ];
 
         console.log('Конфигурация сессии:', JSON.stringify(sessionConfig, null, 2));
+        console.log('Создание Stripe сессии...');
+        
         const session = await stripeInstance.checkout.sessions.create(sessionConfig);
+        
+        console.log('✅ Сессия создана успешно:', session.id);
+        console.log('URL сессии:', session.url);
 
         res.json({ url: session.url });
     } catch (error) {
-        console.error('Ошибка создания сессии:', error);
-        console.error('Детали ошибки:', error.message);
-        res.status(500).json({ error: 'Internal server error', details: error.message });
+        console.error('❌ ОШИБКА создания сессии:', error);
+        console.error('Тип ошибки:', error.type);
+        console.error('Код ошибки:', error.code);
+        console.error('Сообщение:', error.message);
+        console.error('Полный стек:', error.stack);
+        
+        res.status(500).json({ 
+            error: 'Internal server error', 
+            details: error.message,
+            type: error.type,
+            code: error.code
+        });
     }
 });
 
@@ -570,6 +601,13 @@ app.post('/api/payment/success', async (req, res) => {
     
     await user.save();
     
+    // Отправляем письмо с паролем
+    const emailResult = await sendPasswordEmail(user.email, password, user.name);
+    
+    if (!emailResult.success) {
+      console.error('Ошибка отправки письма:', emailResult.error);
+    }
+    
     res.json({
       success: true,
       message: 'Password generated and user updated',
@@ -579,7 +617,8 @@ app.post('/api/payment/success', async (req, res) => {
         email: user.email,
         role: user.role
       },
-      password: password
+      password: password,
+      emailSent: emailResult.success
     });
     
   } catch (error) {
@@ -861,5 +900,14 @@ app.get('/api/health', (req, res) => {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-    console.log(`Сервер запущен на порту ${PORT}`);
+    console.log('=================================');
+    console.log(`✅ Сервер запущен на порту ${PORT}`);
+    console.log('=================================');
+    console.log('Переменные окружения:');
+    console.log('- PORT:', PORT);
+    console.log('- CLIENT_URL:', process.env.CLIENT_URL);
+    console.log('- STRIPE_SECRET_KEY:', process.env.STRIPE_SECRET_KEY ? '✅ Установлен' : '❌ НЕ установлен');
+    console.log('- MONGODB_URI:', process.env.MONGODB_URI ? '✅ Установлен' : '❌ НЕ установлен');
+    console.log('- MAILGUN_API_KEY:', process.env.MAILGUN_API_KEY ? '✅ Установлен' : '❌ НЕ установлен');
+    console.log('=================================');
 });
