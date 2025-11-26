@@ -449,9 +449,19 @@ app.post('/api/users/create-lead', async (req, res) => {
     const existingUser = await User.findOne({ email: email.toLowerCase() });
     
     if (existingUser) {
-      return res.status(409).json({ 
-        success: false, 
-        message: 'User with this email already exists' 
+      // Если пользователь существует, обновляем только имя
+      existingUser.name = name.trim();
+      await existingUser.save();
+      
+      return res.json({
+        success: true,
+        message: 'User name updated',
+        user: {
+          id: existingUser._id,
+          name: existingUser.name,
+          email: existingUser.email,
+          role: existingUser.role
+        }
       });
     }
     
@@ -558,7 +568,7 @@ app.post('/api/users/upgrade-to-customer', async (req, res) => {
 // API для обработки успешной оплаты с email из localStorage
 app.post('/api/payment/success', async (req, res) => {
   try {
-    const { email } = req.body;
+    const { email, name } = req.body;
     
     if (!email) {
       return res.status(400).json({ 
@@ -583,6 +593,12 @@ app.post('/api/payment/success', async (req, res) => {
         success: false, 
         message: 'User already has customer role' 
       });
+    }
+    
+    // Обновляем имя, если оно передано и отличается от текущего
+    if (name && name.trim() !== user.name) {
+      user.name = name.trim();
+      console.log(`Имя пользователя обновлено с "${user.name}" на "${name.trim()}"`);
     }
     
     // Генерируем пароль
