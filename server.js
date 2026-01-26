@@ -1,10 +1,12 @@
+require('dotenv').config();
+
 const express = require('express');
 const cors = require('cors');
 const stripe = require('stripe');
 const mongoose = require('mongoose');
 const Mailgun = require('mailgun.js');
 const FormData = require('form-data');
-require('dotenv').config();
+const googleDriveService = require('./googleDriveService');
 
 // Инициализация Mailgun
 const mailgun = new Mailgun(FormData);
@@ -96,7 +98,75 @@ userSchema.pre('save', function (next) {
   next();
 });
 
+// Модель урока
+const lessonSchema = new mongoose.Schema({
+  lessonId: {
+    type: Number,
+    required: true,
+    unique: true
+  },
+  title: {
+    type: String,
+    required: true,
+    trim: true
+  },
+  category: {
+    type: String,
+    required: true
+  },
+  duration: {
+    type: String,
+    required: true
+  },
+  description: {
+    type: String,
+    required: true
+  },
+  tipTitle: {
+    type: String,
+    default: 'Remember'
+  },
+  tipText: {
+    type: String,
+    required: true
+  },
+  driveVideoId: {
+    type: String,
+    default: null
+  },
+  driveThumbnailId: {
+    type: String,
+    default: null
+  },
+  drivePreviewId: {
+    type: String,
+    default: null
+  },
+  videoUrl: {
+    type: String,
+    default: ''
+  },
+  thumbnailUrl: {
+    type: String,
+    default: ''
+  },
+  videoPreview: {
+    type: String,
+    default: ''
+  },
+  updatedAt: {
+    type: Date,
+    default: Date.now
+  }
+});
+
+lessonSchema.pre('save', function (next) {
+  this.updatedAt = Date.now();
+  next();
+});
+
 const User = mongoose.model('User', userSchema);
+const LessonModel = mongoose.model('Lesson', lessonSchema);
 
 // Генерация пароля
 const generatePassword = (length = 8) => {
@@ -318,61 +388,485 @@ app.post('/create-subscription-session', async (req, res) => {
   }
 });
 
-// Данные уроков
-const LESSONS = {
+// Google Drive Video Management API
+// Получение всех видео из Google Drive для админки
+app.get('/api/admin/drive-videos', async (req, res) => {
+  try {
+    const videos = await googleDriveService.getVideoFiles();
+    const thumbnails = await googleDriveService.getImageFiles('thumbnails');
+    const previews = await googleDriveService.getImageFiles('previews');
+
+    // Объединяем данные
+    const videoData = videos.map(video => {
+      const thumbnail = thumbnails.find(t => t.name.includes(video.name.split('.')[0]));
+      const preview = previews.find(p => p.name.includes(video.name.split('.')[0]));
+      
+      return {
+        id: video.id,
+        name: video.name,
+        size: video.size,
+        createdTime: video.createdTime,
+        directLink: `https://drive.google.com/uc?export=download&id=${video.id}`,
+        webViewLink: video.webViewLink,
+        thumbnail: thumbnail ? thumbnail.directLink : null,
+        preview: preview ? preview.directLink : null
+      };
+    });
+
+    res.json({
+      success: true,
+      videos: videoData
+    });
+  } catch (error) {
+    console.error('Ошибка получения видео из Google Drive:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Ошибка получения видео из Google Drive',
+      error: error.message
+    });
+  }
+});
+
+// Получение прямой ссылки на конкретное видео
+app.get('/api/admin/drive-video/:fileId', async (req, res) => {
+  try {
+    const { fileId } = req.params;
+    const videoData = await googleDriveService.getVideoDirectLink(fileId);
+    
+    res.json({
+      success: true,
+      video: videoData
+    });
+  } catch (error) {
+    console.error('Ошибка получения видео:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Ошибка получения видео',
+      error: error.message
+    });
+  }
+});
+
+// Проверка подключения к Google Drive
+app.get('/api/admin/drive-status', async (req, res) => {
+  try {
+    console.log('=== ДИАГНОСТИКА GOOGLE DRIVE ===');
+    console.log('GOOGLE_SERVICE_ACCOUNT_KEY существует:', !!process.env.GOOGLE_SERVICE_ACCOUNT_KEY);
+    console.log('GOOGLE_DRIVE_FOLDER_ID:', process.env.GOOGLE_DRIVE_FOLDER_ID);
+    
+    if (process.env.GOOGLE_SERVICE_ACCOUNT_KEY) {
+      try {
+        const credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_KEY);
+        console.log('JSON парсится успешно');
+        console.log('client_email:', credentials.client_email);
+        console.log('project_id:', credentials.project_id);
+      } catch (parseError) {
+        console.error('Ошибка парсинга JSON:', parseError.message);
+        return res.json({
+          success: false,
+          message: `Ошибка парсинга JSON: ${parseError.message}`
+        });
+      }
+    }
+    
+    const status = await googleDriveService.checkConnection();
+    console.log('Результат проверки:', status);
+    res.json(status);
+  } catch (error) {
+    console.error('Ошибка в endpoint:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Ошибка проверки подключения',
+      error: error.message
+    });
+  }
+});
+
+// Обновленные данные уроков с поддержкой Google Drive
+const LESSONS_CONFIG = {
   1: {
     id: 1,
     category: 'Body & Posture',
     title: '5-Minute Flow for Daily Rejuvenation',
     duration: '5 min',
-    videoUrl: '/image/videoplayback.mp4',
-    thumbnailUrl: '/image/body-posture.png',
-    videoPreview: '/image/Lesson1.png',
     description: 'Refresh your body in just 5 minutes! Gentle exercises to improve posture, loosen your back, and boost daily energy.',
     tipTitle: 'Remember',
-    tipText: 'Take deep breaths with each movement to relax your muscles and maximize posture benefits.'
+    tipText: 'Take deep breaths with each movement to relax your muscles and maximize posture benefits.',
+    // Google Drive file IDs (будут настроены позже)
+    driveVideoId: null,
+    driveThumbnailId: null,
+    drivePreviewId: null,
+    // Fallback к локальным файлам
+    videoUrl: '/image/videoplayback.mp4',
+    thumbnailUrl: '/image/body-posture.png',
+    videoPreview: '/image/Lesson1.png'
   },
   2: {
     id: 2,
     category: 'Belly & Waist',
     title: '5-Minute Activation for a Younger Waistline',
     duration: '5 min',
-    videoUrl: '/image/videoplayback3.mp4',
-    thumbnailUrl: '/image/belly-waist.png',
-    videoPreview: '/image/Lesson1.png',
     description: 'Targeted exercises to strengthen your core, reduce belly tension, and improve waistline definition in just 5 minutes.',
     tipTitle: 'Remember',
-    tipText: 'Focus on controlled movements and engage your core throughout each exercise for maximum effectiveness.'
+    tipText: 'Focus on controlled movements and engage your core throughout each exercise for maximum effectiveness.',
+    driveVideoId: null,
+    driveThumbnailId: null,
+    drivePreviewId: null,
+    videoUrl: '/image/videoplayback3.mp4',
+    thumbnailUrl: '/image/belly-waist.png',
+    videoPreview: '/image/Lesson1.png'
   },
   3: {
     id: 3,
     category: 'Face & Neck',
     title: 'Get rid of swellness: 5 min massage technique',
     duration: '5 min',
-    videoUrl: '/image/videoplayback2.mp4',
-    thumbnailUrl: '/image/face-neck.png',
-    videoPreview: '/image/Lesson1.png',
     description: 'Gentle massage techniques to reduce facial swelling, improve circulation, and restore natural glow to your skin.',
     tipTitle: 'Remember',
-    tipText: 'Apply gentle pressure and use upward motions to boost circulation and achieve the best anti-aging results.'
+    tipText: 'Apply gentle pressure and use upward motions to boost circulation and achieve the best anti-aging results.',
+    driveVideoId: null,
+    driveThumbnailId: null,
+    drivePreviewId: null,
+    videoUrl: '/image/videoplayback2.mp4',
+    thumbnailUrl: '/image/face-neck.png',
+    videoPreview: '/image/Lesson1.png'
   }
 };
 
-// Получение данных конкретного урока
-app.get('/lesson/:id', (req, res) => {
-  const lessonId = parseInt(req.params.id);
-  const lesson = LESSONS[lessonId];
+// Функция для получения актуальных данных урока с Google Drive
+async function getLessonWithDriveData(lessonId) {
+  // Сначала пытаемся получить данные из БД
+  try {
+    const lessonFromDB = await LessonModel.findOne({ lessonId });
+    if (lessonFromDB) {
+      const lesson = lessonFromDB.toObject();
+      
+      // Если есть Google Drive ID, получаем актуальные ссылки
+      if (lesson.driveVideoId || lesson.driveThumbnailId || lesson.drivePreviewId) {
+        try {
+          const [videoUrl, thumbnailUrl, previewUrl] = await Promise.all([
+            lesson.driveVideoId ? googleDriveService.getDirectLink(lesson.driveVideoId) : Promise.resolve(lesson.videoUrl),
+            lesson.driveThumbnailId ? googleDriveService.getDirectLink(lesson.driveThumbnailId) : Promise.resolve(lesson.thumbnailUrl),
+            lesson.drivePreviewId ? googleDriveService.getDirectLink(lesson.drivePreviewId) : Promise.resolve(lesson.videoPreview)
+          ]);
 
-  if (!lesson) {
-    return res.status(404).json({ error: 'Lesson not found' });
+          console.log(`✅ Урок ${lessonId} загружен из БД с Google Drive ссылками`);
+          console.log(`   Video URL: ${videoUrl}`);
+
+          return {
+            id: lesson.lessonId,
+            category: lesson.category,
+            title: lesson.title,
+            duration: lesson.duration,
+            description: lesson.description,
+            tipTitle: lesson.tipTitle,
+            tipText: lesson.tipText,
+            videoUrl: videoUrl || lesson.videoUrl,
+            thumbnailUrl: thumbnailUrl || lesson.thumbnailUrl,
+            videoPreview: previewUrl || lesson.videoPreview,
+            driveVideoId: lesson.driveVideoId,
+            driveThumbnailId: lesson.driveThumbnailId,
+            drivePreviewId: lesson.drivePreviewId
+          };
+        } catch (driveError) {
+          console.error(`❌ Ошибка получения данных из Google Drive для урока ${lessonId}:`, driveError);
+          // Возвращаем данные из БД с fallback URLs
+          return {
+            id: lesson.lessonId,
+            category: lesson.category,
+            title: lesson.title,
+            duration: lesson.duration,
+            description: lesson.description,
+            tipTitle: lesson.tipTitle,
+            tipText: lesson.tipText,
+            videoUrl: lesson.videoUrl,
+            thumbnailUrl: lesson.thumbnailUrl,
+            videoPreview: lesson.videoPreview,
+            driveVideoId: lesson.driveVideoId,
+            driveThumbnailId: lesson.driveThumbnailId,
+            drivePreviewId: lesson.drivePreviewId
+          };
+        }
+      }
+      
+      // Возвращаем данные из БД без Google Drive
+      console.log(`ℹ️  Урок ${lessonId} загружен из БД без Google Drive ссылок`);
+      return {
+        id: lesson.lessonId,
+        category: lesson.category,
+        title: lesson.title,
+        duration: lesson.duration,
+        description: lesson.description,
+        tipTitle: lesson.tipTitle,
+        tipText: lesson.tipText,
+        videoUrl: lesson.videoUrl,
+        thumbnailUrl: lesson.thumbnailUrl,
+        videoPreview: lesson.videoPreview,
+        driveVideoId: lesson.driveVideoId,
+        driveThumbnailId: lesson.driveThumbnailId,
+        drivePreviewId: lesson.drivePreviewId
+      };
+    }
+  } catch (dbError) {
+    console.error(`❌ Ошибка получения урока ${lessonId} из БД:`, dbError);
+  }
+  
+  // Fallback к LESSONS_CONFIG
+  console.log(`⚠️  Урок ${lessonId} не найден в БД, используем LESSONS_CONFIG`);
+  const lesson = LESSONS_CONFIG[lessonId];
+  if (!lesson) return null;
+
+  try {
+    // Если есть Google Drive ID в конфиге, получаем актуальные ссылки
+    if (lesson.driveVideoId || lesson.driveThumbnailId || lesson.drivePreviewId) {
+      const [videoUrl, thumbnailUrl, previewUrl] = await Promise.all([
+        lesson.driveVideoId ? googleDriveService.getDirectLink(lesson.driveVideoId) : Promise.resolve(lesson.videoUrl),
+        lesson.driveThumbnailId ? googleDriveService.getDirectLink(lesson.driveThumbnailId) : Promise.resolve(lesson.thumbnailUrl),
+        lesson.drivePreviewId ? googleDriveService.getDirectLink(lesson.drivePreviewId) : Promise.resolve(lesson.videoPreview)
+      ]);
+
+      return {
+        ...lesson,
+        videoUrl: videoUrl || lesson.videoUrl,
+        thumbnailUrl: thumbnailUrl || lesson.thumbnailUrl,
+        videoPreview: previewUrl || lesson.videoPreview
+      };
+    }
+  } catch (error) {
+    console.error(`❌ Ошибка получения данных Google Drive для урока ${lessonId}:`, error);
+    // Используем fallback данные из конфига
   }
 
-  res.json(lesson);
+  return lesson;
+}
+
+// Обновленный endpoint для получения конкретного урока
+app.get('/lesson/:id', async (req, res) => {
+  try {
+    const lessonId = parseInt(req.params.id);
+    console.log(`📖 Запрос урока ${lessonId}`);
+    
+    const lesson = await getLessonWithDriveData(lessonId);
+
+    if (!lesson) {
+      console.log(`❌ Урок ${lessonId} не найден`);
+      return res.status(404).json({ error: 'Lesson not found' });
+    }
+
+    console.log(`✅ Урок ${lessonId} отправлен клиенту`);
+    console.log(`   Video URL: ${lesson.videoUrl}`);
+    res.json(lesson);
+  } catch (error) {
+    console.error('❌ Ошибка получения урока:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
-// Получение списка всех уроков
-app.get('/lessons', (req, res) => {
-  res.json(LESSONS);
+// Обновленный endpoint для получения всех уроков
+app.get('/lessons', async (req, res) => {
+  try {
+    const lessons = {};
+    
+    for (const [id, lesson] of Object.entries(LESSONS_CONFIG)) {
+      lessons[id] = await getLessonWithDriveData(parseInt(id));
+    }
+    
+    res.json(lessons);
+  } catch (error) {
+    console.error('Ошибка получения уроков:', error);
+    // Возвращаем fallback данные
+    res.json(LESSONS_CONFIG);
+  }
+});
+
+// API для обновления Google Drive ID урока (для админки)
+app.put('/api/admin/lesson/:id/drive-ids', async (req, res) => {
+  try {
+    const lessonId = parseInt(req.params.id);
+    const { driveVideoId, driveThumbnailId, drivePreviewId } = req.body;
+
+    if (!LESSONS_CONFIG[lessonId]) {
+      return res.status(404).json({
+        success: false,
+        message: 'Урок не найден'
+      });
+    }
+
+    // Ищем урок в БД
+    let lesson = await LessonModel.findOne({ lessonId });
+    
+    if (lesson) {
+      // Обновляем существующий урок
+      if (driveVideoId !== undefined) lesson.driveVideoId = driveVideoId;
+      if (driveThumbnailId !== undefined) lesson.driveThumbnailId = driveThumbnailId;
+      if (drivePreviewId !== undefined) lesson.drivePreviewId = drivePreviewId;
+      await lesson.save();
+    } else {
+      // Создаем новый урок на основе конфига
+      const configLesson = LESSONS_CONFIG[lessonId];
+      lesson = new LessonModel({
+        lessonId: lessonId,
+        title: configLesson.title,
+        category: configLesson.category,
+        duration: configLesson.duration,
+        description: configLesson.description,
+        tipTitle: configLesson.tipTitle,
+        tipText: configLesson.tipText,
+        driveVideoId: driveVideoId || configLesson.driveVideoId,
+        driveThumbnailId: driveThumbnailId || configLesson.driveThumbnailId,
+        drivePreviewId: drivePreviewId || configLesson.drivePreviewId,
+        videoUrl: configLesson.videoUrl,
+        thumbnailUrl: configLesson.thumbnailUrl,
+        videoPreview: configLesson.videoPreview
+      });
+      await lesson.save();
+    }
+
+    // Также обновляем в памяти для обратной совместимости
+    if (driveVideoId) LESSONS_CONFIG[lessonId].driveVideoId = driveVideoId;
+    if (driveThumbnailId) LESSONS_CONFIG[lessonId].driveThumbnailId = driveThumbnailId;
+    if (drivePreviewId) LESSONS_CONFIG[lessonId].drivePreviewId = drivePreviewId;
+
+    res.json({
+      success: true,
+      message: 'Google Drive ID обновлены и сохранены в базе данных',
+      lesson: {
+        id: lesson.lessonId,
+        title: lesson.title,
+        category: lesson.category,
+        driveVideoId: lesson.driveVideoId,
+        driveThumbnailId: lesson.driveThumbnailId,
+        drivePreviewId: lesson.drivePreviewId
+      }
+    });
+  } catch (error) {
+    console.error('Ошибка обновления Google Drive ID:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Ошибка обновления',
+      error: error.message
+    });
+  }
+});
+
+// API для получения всех уроков для админки
+app.get('/api/admin/lessons', async (req, res) => {
+  try {
+    const lessonsFromDB = await LessonModel.find().sort({ lessonId: 1 });
+    
+    if (lessonsFromDB.length > 0) {
+      const lessons = lessonsFromDB.map(lesson => ({
+        id: lesson.lessonId,
+        category: lesson.category,
+        title: lesson.title,
+        duration: lesson.duration,
+        description: lesson.description,
+        tipTitle: lesson.tipTitle,
+        tipText: lesson.tipText,
+        driveVideoId: lesson.driveVideoId,
+        driveThumbnailId: lesson.driveThumbnailId,
+        drivePreviewId: lesson.drivePreviewId
+      }));
+      
+      return res.json({
+        success: true,
+        lessons
+      });
+    }
+    
+    // Если в БД нет уроков, возвращаем из конфига
+    const lessons = Object.values(LESSONS_CONFIG).map(lesson => ({
+      id: lesson.id,
+      category: lesson.category,
+      title: lesson.title,
+      duration: lesson.duration,
+      description: lesson.description,
+      tipTitle: lesson.tipTitle,
+      tipText: lesson.tipText,
+      driveVideoId: lesson.driveVideoId,
+      driveThumbnailId: lesson.driveThumbnailId,
+      drivePreviewId: lesson.drivePreviewId
+    }));
+    
+    res.json({
+      success: true,
+      lessons
+    });
+  } catch (error) {
+    console.error('Ошибка получения уроков:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Ошибка получения уроков',
+      error: error.message
+    });
+  }
+});
+
+// API для обновления названия урока
+app.put('/api/admin/lesson/:id/title', async (req, res) => {
+  try {
+    const lessonId = parseInt(req.params.id);
+    const { title } = req.body;
+
+    if (!title || title.trim() === '') {
+      return res.status(400).json({
+        success: false,
+        message: 'Название урока не может быть пустым'
+      });
+    }
+
+    // Проверяем существование урока в конфиге
+    if (!LESSONS_CONFIG[lessonId]) {
+      return res.status(404).json({
+        success: false,
+        message: 'Урок не найден'
+      });
+    }
+
+    // Ищем урок в БД
+    let lesson = await LessonModel.findOne({ lessonId });
+    
+    if (lesson) {
+      // Обновляем существующий урок
+      lesson.title = title.trim();
+      await lesson.save();
+    } else {
+      // Создаем новый урок на основе конфига
+      const configLesson = LESSONS_CONFIG[lessonId];
+      lesson = new LessonModel({
+        lessonId: lessonId,
+        title: title.trim(),
+        category: configLesson.category,
+        duration: configLesson.duration,
+        description: configLesson.description,
+        tipTitle: configLesson.tipTitle,
+        tipText: configLesson.tipText,
+        driveVideoId: configLesson.driveVideoId,
+        driveThumbnailId: configLesson.driveThumbnailId,
+        drivePreviewId: configLesson.drivePreviewId,
+        videoUrl: configLesson.videoUrl,
+        thumbnailUrl: configLesson.thumbnailUrl,
+        videoPreview: configLesson.videoPreview
+      });
+      await lesson.save();
+    }
+
+    res.json({
+      success: true,
+      message: 'Название урока обновлено',
+      lesson: {
+        id: lesson.lessonId,
+        title: lesson.title
+      }
+    });
+  } catch (error) {
+    console.error('Ошибка обновления названия урока:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Ошибка обновления',
+      error: error.message
+    });
+  }
 });
 
 // Получение списка доступных планов
